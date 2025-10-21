@@ -29,6 +29,12 @@ import {
   hasMacOSSandboxDependenciesSync,
 } from './macos-sandbox-utils.js'
 import {
+  wrapCommandWithSandboxFreeBSD,
+  initializeFreeBSDNetworkBridge,
+  hasFreeBSDSandboxDependenciesSync,
+  type FreeBSDNetworkBridgeContext,
+} from './freebsd-sandbox-utils.js'
+import {
   getDefaultWritePaths,
   containsGlobChars,
   removeTrailingGlobSuffix,
@@ -40,6 +46,7 @@ interface HostNetworkManagerContext {
   httpProxyPort: number
   socksProxyPort: number
   linuxBridge: LinuxNetworkBridgeContext | undefined
+  freebsdBridge: FreeBSDNetworkBridgeContext | undefined
 }
 
 // ============================================================================
@@ -325,8 +332,15 @@ async function initialize(
 
       // Initialize platform-specific infrastructure
       let linuxBridge: LinuxNetworkBridgeContext | undefined
+      let freebsdBridge: FreeBSDNetworkBridgeContext | undefined
+
       if (getPlatform() === 'linux') {
         linuxBridge = await initializeLinuxNetworkBridge(
+          httpProxyPort,
+          socksProxyPort,
+        )
+      } else if (getPlatform() === 'freebsd') {
+        freebsdBridge = await initializeFreeBSDNetworkBridge(
           httpProxyPort,
           socksProxyPort,
         )
@@ -336,6 +350,7 @@ async function initialize(
         httpProxyPort,
         socksProxyPort,
         linuxBridge,
+        freebsdBridge,
       }
       managerContext = context
       logForDebugging('Network infrastructure initialized')
@@ -357,7 +372,7 @@ async function initialize(
 }
 
 function isSupportedPlatform(platform: Platform): boolean {
-  const supportedPlatforms: Platform[] = ['macos', 'linux']
+  const supportedPlatforms: Platform[] = ['macos', 'linux', 'freebsd']
   return supportedPlatforms.includes(platform)
 }
 
@@ -380,6 +395,15 @@ function isSandboxingEnabled(): boolean {
     throw new Error(
       'ripgrep (rg) not found. Please install ripgrep.\n' +
       '  Install with: brew install ripgrep',
+    )
+  }
+
+  // On FreeBSD, check if required dependencies are available
+  if (getPlatform() === 'freebsd' && !hasFreeBSDSandboxDependenciesSync()) {
+    throw new Error(
+      'Required dependencies not found. Please install: jail, socat, and ripgrep\n' +
+      '  Install with: pkg install socat ripgrep\n' +
+      '  Note: jail command is part of FreeBSD base system',
     )
   }
 
@@ -545,6 +569,14 @@ function getLinuxSocksSocketPath(): string | undefined {
   return managerContext?.linuxBridge?.socksSocketPath
 }
 
+function getFreeBSDHttpSocketPath(): string | undefined {
+  return managerContext?.freebsdBridge?.httpSocketPath
+}
+
+function getFreeBSDSocksSocketPath(): string | undefined {
+  return managerContext?.freebsdBridge?.socksSocketPath
+}
+
 /**
  * Wait for network initialization to complete if already in progress
  * Returns true if initialized successfully, false otherwise
@@ -606,6 +638,19 @@ async function wrapWithSandbox(command: string): Promise<string> {
         enableWeakerNestedSandbox: getEnableWeakerNestedSandbox(),
       })
 
+    case 'freebsd':
+      return wrapCommandWithSandboxFreeBSD({
+        command,
+        hasNetworkRestrictions: true,
+        hasFilesystemRestrictions: true,
+        httpSocketPath: getFreeBSDHttpSocketPath(),
+        socksSocketPath: getFreeBSDSocksSocketPath(),
+        httpProxyPort: managerContext?.httpProxyPort,
+        socksProxyPort: managerContext?.socksProxyPort,
+        readConfig: getFsReadConfig(),
+        writeConfig: getFsWriteConfig(),
+      })
+
     default:
       // Unsupported platform - this should not happen since isSandboxingEnabled() checks platform support
       throw new Error(
@@ -621,6 +666,7 @@ async function reset(): Promise<void> {
     logMonitorShutdown = undefined
   }
 
+  // Cleanup Linux bridge
   if (managerContext?.linuxBridge) {
     const {
       httpSocketPath,
@@ -633,10 +679,10 @@ async function reset(): Promise<void> {
     if (httpBridgeProcess.pid && !httpBridgeProcess.killed) {
       try {
         process.kill(httpBridgeProcess.pid, 'SIGTERM')
-        logForDebugging('Killed HTTP bridge process')
+        logForDebugging('Killed Linux HTTP bridge process')
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== 'ESRCH') {
-          logForDebugging(`Error killing HTTP bridge: ${err}`, {
+          logForDebugging(`Error killing Linux HTTP bridge: ${err}`, {
             level: 'error',
           })
         }
@@ -647,10 +693,10 @@ async function reset(): Promise<void> {
     if (socksBridgeProcess.pid && !socksBridgeProcess.killed) {
       try {
         process.kill(socksBridgeProcess.pid, 'SIGTERM')
-        logForDebugging('Killed SOCKS bridge process')
+        logForDebugging('Killed Linux SOCKS bridge process')
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== 'ESRCH') {
-          logForDebugging(`Error killing SOCKS bridge: ${err}`, {
+          logForDebugging(`Error killing Linux SOCKS bridge: ${err}`, {
             level: 'error',
           })
         }
@@ -661,9 +707,9 @@ async function reset(): Promise<void> {
     if (httpSocketPath) {
       try {
         fs.rmSync(httpSocketPath, { force: true })
-        logForDebugging('Cleaned up HTTP socket')
+        logForDebugging('Cleaned up Linux HTTP socket')
       } catch (err) {
-        logForDebugging(`HTTP socket cleanup error: ${err}`, {
+        logForDebugging(`Linux HTTP socket cleanup error: ${err}`, {
           level: 'error',
         })
       }
@@ -672,9 +718,70 @@ async function reset(): Promise<void> {
     if (socksSocketPath) {
       try {
         fs.rmSync(socksSocketPath, { force: true })
-        logForDebugging('Cleaned up SOCKS socket')
+        logForDebugging('Cleaned up Linux SOCKS socket')
       } catch (err) {
-        logForDebugging(`SOCKS socket cleanup error: ${err}`, {
+        logForDebugging(`Linux SOCKS socket cleanup error: ${err}`, {
+          level: 'error',
+        })
+      }
+    }
+  }
+
+  // Cleanup FreeBSD bridge
+  if (managerContext?.freebsdBridge) {
+    const {
+      httpSocketPath,
+      socksSocketPath,
+      httpBridgeProcess,
+      socksBridgeProcess,
+    } = managerContext.freebsdBridge
+
+    // Kill HTTP bridge
+    if (httpBridgeProcess.pid && !httpBridgeProcess.killed) {
+      try {
+        process.kill(httpBridgeProcess.pid, 'SIGTERM')
+        logForDebugging('Killed FreeBSD HTTP bridge process')
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'ESRCH') {
+          logForDebugging(`Error killing FreeBSD HTTP bridge: ${err}`, {
+            level: 'error',
+          })
+        }
+      }
+    }
+
+    // Kill SOCKS bridge
+    if (socksBridgeProcess.pid && !socksBridgeProcess.killed) {
+      try {
+        process.kill(socksBridgeProcess.pid, 'SIGTERM')
+        logForDebugging('Killed FreeBSD SOCKS bridge process')
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'ESRCH') {
+          logForDebugging(`Error killing FreeBSD SOCKS bridge: ${err}`, {
+            level: 'error',
+          })
+        }
+      }
+    }
+
+    // Clean up sockets
+    if (httpSocketPath) {
+      try {
+        fs.rmSync(httpSocketPath, { force: true })
+        logForDebugging('Cleaned up FreeBSD HTTP socket')
+      } catch (err) {
+        logForDebugging(`FreeBSD HTTP socket cleanup error: ${err}`, {
+          level: 'error',
+        })
+      }
+    }
+
+    if (socksSocketPath) {
+      try {
+        fs.rmSync(socksSocketPath, { force: true })
+        logForDebugging('Cleaned up FreeBSD SOCKS socket')
+      } catch (err) {
+        logForDebugging(`FreeBSD SOCKS socket cleanup error: ${err}`, {
           level: 'error',
         })
       }
